@@ -88,18 +88,20 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	// 认购：张伟 30%、李娜 25%、王强 15%；赵敏只参与公共收益分配
-	sub := func(uid int64, ratio float64) {
+	sub := func(uid int64, ratio float64) int64 {
 		count := int(ratio/100*80 + 0.5)
-		if _, err := tx.Exec(ctx, `
+		var id int64
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO subscriptions(building_id,user_id,sub_type,panel_ratio,panel_count,amount,status,paid_at)
-			VALUES ($1,$2,'shareholder',$3,$4,$5,'paid',now())`,
-			b1, uid, ratio, count, count*1500); err != nil {
+			VALUES ($1,$2,'shareholder',$3,$4,$5,'paid',now()) RETURNING id`,
+			b1, uid, ratio, count, count*1500).Scan(&id); err != nil {
 			panic(err)
 		}
+		return id
 	}
-	sub(r1, 30)
-	sub(r2, 25)
-	sub(r3, 15)
+	sub1 := sub(r1, 30)
+	sub2 := sub(r2, 25)
+	sub3 := sub(r3, 15)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO subscriptions(building_id,user_id,sub_type,panel_ratio,status,paid_at)
 		VALUES ($1,$2,'public_only',0,'paid',now())`, b1, r4); err != nil {
@@ -118,6 +120,19 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 		 VALUES ($1,NULL,'in',84000,'subscription','subscription','三户认购组件款入公共账户')`,
 		b1); err != nil {
 		return err
+	}
+	// 三户认购发票（INV-S{id} 号段，与迁移回填号段一致）
+	for _, s := range []struct {
+		sid, uid int64
+		name     string
+		amount   float64
+	}{{sub1, r1, "张伟(顶楼)", 36000}, {sub2, r2, "李娜", 30000}, {sub3, r3, "王强", 18000}} {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO invoices(invoice_no,building_id,subscription_id,user_id,holder_name,inv_type,amount,memo)
+			VALUES ($1,$2,$3,$4,$5,'subscription',$6,'光伏组件认购款发票')`,
+			fmt.Sprintf("INV-S%d", s.sid), b1, s.sid, s.uid, s.name, s.amount); err != nil {
+			return err
+		}
 	}
 
 	// 两台逆变器
@@ -163,6 +178,14 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	// 8 月结算：用结算引擎真实定稿，并同步台账/住户余额/收付款记录
 	if err := seedFinalizeAugust(ctx, tx, b1, property, r1, r2, r3); err != nil {
+		return err
+	}
+	// 张伟 9 月初提现一笔收益（演示收益账户提现与交割附件中的已提现记录）
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO withdrawals(user_id,amount,memo) VALUES ($1,200.00,'首次发电收益提现')`, r1); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE users SET balance=balance-200.00 WHERE id=$1`, r1); err != nil {
 		return err
 	}
 

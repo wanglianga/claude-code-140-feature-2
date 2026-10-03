@@ -352,6 +352,18 @@ func (s *Server) paySubscription(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 开具认购发票（抬头=认购住户本人，物业/管理员代缴时同样抬头到户）
+	if amount > 0 {
+		var holder string
+		if err := tx.QueryRow(r.Context(), `SELECT name FROM users WHERE id=$1`, uid).Scan(&holder); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		if _, err := s.issueInvoiceTx(r, tx, bid, sid, nil, uid, holder, "subscription", amount, "光伏组件认购款发票"); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+	}
 	// 刷新楼栋已认购比例
 	if _, err := tx.Exec(r.Context(),
 		`UPDATE buildings SET subscribed_ratio=(SELECT COALESCE(SUM(panel_ratio),0) FROM subscriptions

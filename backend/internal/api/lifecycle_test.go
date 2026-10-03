@@ -61,6 +61,21 @@ func (c *client) login(phone, pwd string) string {
 	return out["token"].(string)
 }
 
+// getRaw 原始 GET（用于 CSV 等非 JSON 响应）
+func (c *client) getRaw(path, token string) (int, []byte, string) {
+	req, _ := http.NewRequest("GET", c.srv.URL+path, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.t.Fatalf("raw get %s: %v", path, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, raw, resp.Header.Get("Content-Type")
+}
+
 func setup(t *testing.T) *client {
 	t.Helper()
 	ctx := context.Background()
@@ -308,7 +323,21 @@ func TestFullLifecycle(t *testing.T) {
 		t.Fatalf("维修基金=%v want 9.6", out["maintenance_fund_balance"])
 	}
 
-	// 房屋转让：甲把认购权益随房转给丙
+	// ---- 收益账户提现：甲提现 20，余额 64 → 44 ----
+	st, out = c.do("POST", "/api/me/withdrawals", tA, map[string]any{"amount": 20, "memo": "测试提现"})
+	if st != 201 || out["balance"].(string) != "44.00" {
+		t.Fatalf("提现: %d %v", st, out)
+	}
+	st, out = c.do("GET", "/api/me/withdrawals", tA, nil)
+	if st != 200 || len(out["items"].([]any)) != 1 {
+		t.Fatalf("提现记录: %d %v", st, out)
+	}
+	// 超额提现应被拒
+	if st, _ = c.do("POST", "/api/me/withdrawals", tA, map[string]any{"amount": 99999}); st != 409 {
+		t.Fatalf("余额不足提现应 409, got %d", st)
+	}
+
+	// ---- 转让前检查：份额/未结收益/维修分摊/三种方式影响 ----
 	var subA int64
 	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/subscriptions", bid), admin, nil)
 	for _, it := range out["items"].([]any) {
@@ -317,15 +346,110 @@ func TestFullLifecycle(t *testing.T) {
 			subA = int64(m["id"].(float64))
 		}
 	}
+	st, out = c.do("GET", fmt.Sprintf("/api/subscriptions/%d/transfer-check", subA), tA, nil)
+	if st != 200 {
+		t.Fatalf("transfer-check: %d %v", st, out)
+	}
+	if out["can_transfer"].(bool) != true || out["history_settled"].(bool) != true {
+		t.Fatalf("9月已定稿，应可转让: %v", out)
+	}
+	if out["unsettled"].(map[string]any)["draft_count"].(float64) != 0 {
+		t.Fatalf("未结收益期数应 0: %v", out["unsettled"])
+	}
+	if out["maintenance"].(map[string]any)["open_count"].(float64) != 0 {
+		t.Fatalf("工单已解决，维修分摊敞口应 0: %v", out["maintenance"])
+	}
+	modes := out["modes"].(map[string]any)
+	if modes["early_settlement"].(map[string]any)["ratio_after"].(float64) != 30 {
+		t.Fatalf("甲退出后楼栋认购比例应 30: %v", modes)
+	}
+	if modes["with_house"].(map[string]any)["ratio_after"].(float64) != 70 {
+		t.Fatalf("随房转让比例应不变 70: %v", modes)
+	}
+	// 他人不可查看该户的转让前检查（含余额）
+	if st, _ = c.do("GET", fmt.Sprintf("/api/subscriptions/%d/transfer-check", subA), tB, nil); st != 403 {
+		t.Fatalf("他户查看转让前检查应 403, got %d", st)
+	}
+
+	// ---- 房屋转让（随房转让）：甲 -> 丙，买方接受后物业审核 ----
 	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/transfers", bid), tA, map[string]any{
-		"subscription_id": subA, "to_user_id": idC, "rights_transfer": true,
+		"subscription_id": subA, "mode": "with_house", "to_user_id": idC,
+		"materials": []string{"房屋买卖合同", "不动产权证复印件", "光伏认购权益受让确认书"},
 	})
 	if st != 201 {
 		t.Fatalf("transfer create: %d %v", st, out)
 	}
 	trID := int64(out["id"].(float64))
-	if st, out := c.do("POST", fmt.Sprintf("/api/transfers/%d/confirm", trID), admin, nil); st != 200 {
+	// 买方未接受前确认应被拒
+	if st, _ = c.do("POST", fmt.Sprintf("/api/transfers/%d/confirm", trID), admin, nil); st != 409 {
+		t.Fatalf("买方未接受时确认应 409, got %d", st)
+	}
+	// 非买方接受应 403
+	if st, _ = c.do("POST", fmt.Sprintf("/api/transfers/%d/accept", trID), tA,
+		map[string]any{"accept": true}); st != 403 {
+		t.Fatalf("非买方接受应 403, got %d", st)
+	}
+	// 买方丙在线接受
+	st, out = c.do("POST", fmt.Sprintf("/api/transfers/%d/accept", trID), tC, map[string]any{"accept": true})
+	if st != 200 {
+		t.Fatalf("买方接受: %d %v", st, out)
+	}
+	// 买方对历史收益提出争议（不影响办理，但会进入交割附件）
+	st, out = c.do("POST", fmt.Sprintf("/api/transfers/%d/dispute", trID), tC,
+		map[string]string{"note": "对 9 月维修分摊金额有异议，要求留存记录"})
+	if st != 200 {
+		t.Fatalf("登记争议: %d %v", st, out)
+	}
+	st, out = c.do("POST", fmt.Sprintf("/api/transfers/%d/confirm", trID), admin,
+		map[string]string{"review_note": "过户材料齐全，审核通过"})
+	if st != 200 || out["mode"] != "with_house" || out["invoice_no"] == "" {
 		t.Fatalf("transfer confirm: %d %v", st, out)
+	}
+	// 楼栋认购比例不变（70%）
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d", bid), admin, nil)
+	if out["subscribed_ratio"].(float64) != 70 {
+		t.Fatalf("随房转让后认购比例应不变: %v", out["subscribed_ratio"])
+	}
+	// 发票：原认购发票已换开作废，新发票抬头为丙
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/invoices", bid), admin, nil)
+	var oldInvReplaced, reissueOK bool
+	for _, it := range out["items"].([]any) {
+		m := it.(map[string]any)
+		if int64(m["subscription_id"].(float64)) == subA && m["inv_type"] == "subscription" && m["status"] == "replaced" {
+			oldInvReplaced = true
+		}
+		if m["inv_type"] == "reissue" && int64(m["user_id"].(float64)) == idC &&
+			m["status"] == "valid" && m["amount"].(float64) == 36000 {
+			reissueOK = true
+		}
+	}
+	if !oldInvReplaced || !reissueOK {
+		t.Fatalf("随房转让发票换开不正确: replaced=%v reissue=%v", oldInvReplaced, reissueOK)
+	}
+
+	// ---- 交割附件导出（JSON + CSV） ----
+	st, out = c.do("GET", fmt.Sprintf("/api/transfers/%d/export", trID), tA, nil)
+	if st != 200 {
+		t.Fatalf("export: %d %v", st, out)
+	}
+	if len(out["generation"].([]any)) != 2 || len(out["settlements"].([]any)) != 1 {
+		t.Fatalf("导出应含 9 月 2 条发电与 1 条结算: gen=%v set=%v",
+			len(out["generation"].([]any)), len(out["settlements"].([]any)))
+	}
+	if len(out["withdrawals"].([]any)) != 1 || len(out["invoices"].([]any)) != 2 {
+		t.Fatalf("导出应含 1 条提现与 2 张发票: %v %v", out["withdrawals"], out["invoices"])
+	}
+	if out["dispute_note"].(string) == "" {
+		t.Fatalf("导出应含争议记录")
+	}
+	// 无关住户不可导出
+	if st, _ = c.do("GET", fmt.Sprintf("/api/transfers/%d/export", trID), tB, nil); st != 403 {
+		t.Fatalf("无关住户导出应 403, got %d", st)
+	}
+	csvStatus, csvBody, csvCT := c.getRaw(fmt.Sprintf("/api/transfers/%d/export?format=csv", trID), tA)
+	if csvStatus != 200 || csvCT == "" || len(csvBody) < 100 ||
+		!bytes.Contains(csvBody, []byte("月度发电")) || !bytes.Contains(csvBody, []byte("已提现")) {
+		t.Fatalf("CSV 导出异常: %d %s %d", csvStatus, csvCT, len(csvBody))
 	}
 
 	// 10 月发电再结算：40% 份额应归丙，甲不再出现在住户明细
@@ -407,6 +531,128 @@ func TestFullLifecycle(t *testing.T) {
 	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/dashboard", bid), admin, nil)
 	if st != 200 || out["total_kwh"].(float64) != 3000 {
 		t.Fatalf("dashboard: %d %v", st, out)
+	}
+
+	// ---- 提前结算退出：乙出售房屋选择退出，认购款退还至收益账户 ----
+	var subB int64
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/subscriptions", bid), admin, nil)
+	for _, it := range out["items"].([]any) {
+		m := it.(map[string]any)
+		if int64(m["user_id"].(float64)) == idB && m["status"] == "paid" {
+			subB = int64(m["id"].(float64))
+		}
+	}
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/transfers", bid), tB, map[string]any{
+		"subscription_id": subB, "mode": "early_settlement",
+		"materials": []string{"房屋买卖合同", "不动产权证复印件"},
+	})
+	if st != 201 {
+		t.Fatalf("exit create: %d %v", st, out)
+	}
+	exitID := int64(out["id"].(float64))
+	st, out = c.do("POST", fmt.Sprintf("/api/transfers/%d/confirm", exitID), admin,
+		map[string]string{"review_note": "历史收益已结清，同意退出"})
+	if st != 200 || out["mode"] != "early_settlement" {
+		t.Fatalf("exit confirm: %d %v", st, out)
+	}
+	// 乙收益账户 = 9月 48 + 10月 144 + 退款 27000 = 27192
+	st, out = c.do("GET", "/api/me", tB, nil)
+	if out["balance"].(string) != "27192.00" {
+		t.Fatalf("乙退出后余额=%v want 27192.00", out["balance"])
+	}
+	// 楼栋认购比例 70 → 40
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d", bid), admin, nil)
+	if out["subscribed_ratio"].(float64) != 40 {
+		t.Fatalf("乙退出后认购比例应 40: %v", out["subscribed_ratio"])
+	}
+	// 发票：乙的认购发票已红冲，退款凭证 27000 已开具
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/invoices", bid), admin, nil)
+	var voidedOK, refundInvOK bool
+	for _, it := range out["items"].([]any) {
+		m := it.(map[string]any)
+		if int64(m["subscription_id"].(float64)) == subB && m["inv_type"] == "subscription" && m["status"] == "voided" {
+			voidedOK = true
+		}
+		if m["inv_type"] == "refund" && int64(m["user_id"].(float64)) == idB && m["amount"].(float64) == 27000 {
+			refundInvOK = true
+		}
+	}
+	if !voidedOK || !refundInvOK {
+		t.Fatalf("提前结算退出发票不正确: voided=%v refund=%v", voidedOK, refundInvOK)
+	}
+
+	// ---- 转给同楼栋住户：丙 -> 甲（非本楼住户应被拒） ----
+	registerResident(c, admin, "丁(外楼)", "13100000004", "9-101")
+	idD := userID(c, admin, "13100000004")
+	var subC int64
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d/subscriptions", bid), admin, nil)
+	for _, it := range out["items"].([]any) {
+		m := it.(map[string]any)
+		if int64(m["user_id"].(float64)) == idC && m["status"] == "paid" {
+			subC = int64(m["id"].(float64))
+		}
+	}
+	st, _ = c.do("POST", fmt.Sprintf("/api/buildings/%d/transfers", bid), tC, map[string]any{
+		"subscription_id": subC, "mode": "to_resident", "to_user_id": idD,
+	})
+	if st != 409 {
+		t.Fatalf("受让人非本楼住户应 409, got %d", st)
+	}
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/transfers", bid), tC, map[string]any{
+		"subscription_id": subC, "mode": "to_resident", "to_user_id": idA,
+		"materials": []string{"楼内转让协议"},
+	})
+	if st != 201 {
+		t.Fatalf("to_resident create: %d %v", st, out)
+	}
+	tr2ID := int64(out["id"].(float64))
+	st, out = c.do("POST", fmt.Sprintf("/api/transfers/%d/accept", tr2ID), tA, map[string]any{"accept": true})
+	if st != 200 {
+		t.Fatalf("甲接受: %d %v", st, out)
+	}
+	st, out = c.do("POST", fmt.Sprintf("/api/transfers/%d/confirm", tr2ID), admin, nil)
+	if st != 200 {
+		t.Fatalf("to_resident confirm: %d %v", st, out)
+	}
+	st, out = c.do("GET", fmt.Sprintf("/api/buildings/%d", bid), admin, nil)
+	if out["subscribed_ratio"].(float64) != 40 {
+		t.Fatalf("楼内转让比例应不变 40: %v", out["subscribed_ratio"])
+	}
+
+	// ---- 11 月结算：40% 份额归甲（审核通过后下一期按新权益人发放），乙/丙不再参与 ----
+	for _, x := range []struct {
+		inv int64
+		kwh float64
+	}{{inv1, 500}, {inv2, 500}} {
+		c.do("POST", fmt.Sprintf("/api/buildings/%d/generation", bid), admin, map[string]any{
+			"period_month": "2026-11", "inverter_id": x.inv, "kwh": x.kwh,
+		})
+	}
+	st, out = c.do("POST", fmt.Sprintf("/api/buildings/%d/settlements", bid), admin, map[string]any{
+		"period_month": "2026-11", "grid_price": 0.4,
+	})
+	if st != 200 {
+		t.Fatalf("nov settlement: %d %v", st, out)
+	}
+	novID := int64(out["id"].(float64))
+	st, out = c.do("GET", fmt.Sprintf("/api/settlements/%d", novID), admin, nil)
+	nov := map[int64]float64{}
+	for _, it := range out["items"].([]any) {
+		m := it.(map[string]any)
+		if m["item_type"] == "shareholder" {
+			nov[int64(m["user_id"].(float64))] = m["amount"].(float64)
+		}
+	}
+	if len(nov) != 1 || nov[idA] != 160 {
+		t.Fatalf("11月仅甲按 40%% 分成 160: %v", nov)
+	}
+	if st, out = c.do("POST", fmt.Sprintf("/api/settlements/%d/finalize", novID), admin, nil); st != 200 {
+		t.Fatalf("nov finalize: %d %v", st, out)
+	}
+	// 甲余额 = 64 - 20(提现) + 160 = 204
+	st, out = c.do("GET", "/api/me", tA, nil)
+	if out["balance"].(string) != "204.00" {
+		t.Fatalf("甲余额=%v want 204.00", out["balance"])
 	}
 
 	// 阶段回退必须有原因

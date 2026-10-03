@@ -9,6 +9,73 @@ const CAT_LABEL = {
   transfer_in: '权益转入',
 }
 
+// 我的收益账户：余额、提现、提现记录（跨楼栋汇总）
+function MyAccount({ user }) {
+  const { notify } = useToast()
+  const [balance, setBalance] = useState('0.00')
+  const [withdrawals, setWithdrawals] = useState([])
+  const [amount, setAmount] = useState('')
+  const [memo, setMemo] = useState('')
+
+  const load = async () => {
+    try {
+      const [me, wd] = await Promise.all([
+        handleErr(api('GET', '/me'), notify),
+        api('GET', '/me/withdrawals').catch(() => ({ items: [] })),
+      ])
+      setBalance(me.balance)
+      setWithdrawals(wd.items || [])
+    } catch { /* toast */ }
+  }
+  useEffect(() => { load() }, [])
+
+  const withdraw = async () => {
+    const v = Number(amount)
+    if (!v || v <= 0) return notify('请输入正确的提现金额', true)
+    try {
+      await handleErr(api('POST', '/me/withdrawals', { amount: v, memo }), notify)
+      notify('提现成功')
+      setAmount('')
+      setMemo('')
+      load()
+    } catch { /* toast */ }
+  }
+
+  return (
+    <div className="card">
+      <div className="card-title">
+        <h2>我的收益账户（全部楼栋汇总）</h2>
+        <div className="btn-row">
+          <input style={{ width: 120 }} placeholder="提现金额" value={amount} onChange={(e) => setAmount(e.target.value)} />
+          <input style={{ width: 160 }} placeholder="备注（可选）" value={memo} onChange={(e) => setMemo(e.target.value)} />
+          <button className="primary sm" onClick={withdraw}>提现</button>
+        </div>
+      </div>
+      <div className="grid grid-3" style={{ marginBottom: 12 }}>
+        <div className="card stat accent">
+          <div className="label">可提现余额</div>
+          <div className="value">¥{fmtMoney(balance)}</div>
+          <div className="sub">月度结算定稿后计入；提前结算退出退款也计入此处</div>
+        </div>
+      </div>
+      {withdrawals.length > 0 && (
+        <table>
+          <thead><tr><th>提现时间</th><th className="num">金额</th><th>备注</th></tr></thead>
+          <tbody>
+            {withdrawals.map((w) => (
+              <tr key={w.id}>
+                <td className="small">{new Date(w.created_at).toLocaleString('zh-CN')}</td>
+                <td className="num">¥{fmtMoney(w.amount)}</td>
+                <td className="small muted">{w.memo}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
 export default function LedgerTab({ user, building }) {
   const { notify } = useToast()
   const [ledger, setLedger] = useState([])
@@ -32,6 +99,8 @@ export default function LedgerTab({ user, building }) {
 
   return (
     <>
+      <MyAccount user={user} />
+
       <div className="grid grid-3">
         <div className="card stat accent">
           <div className="label">公共账户净额</div>
