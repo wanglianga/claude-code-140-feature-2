@@ -86,11 +86,21 @@ func (s *Server) Router() http.Handler {
 		r.Get("/buildings/{id}/ledger", s.listLedger)
 		r.Get("/buildings/{id}/payments", s.listPayments)
 
-		// 房屋转让/退购
+		// 房屋转让/认购权益处理
 		r.Get("/buildings/{id}/transfers", s.listTransfers)
 		r.Post("/buildings/{id}/transfers", s.createTransfer)
+		r.Get("/buildings/{id}/transfer-check", s.transferCheck)
+		r.Get("/buildings/{id}/transfer-export", s.transferExport)
+		r.Post("/transfers/{tid}/accept", s.acceptTransfer)
 		r.Post("/transfers/{tid}/confirm", s.confirmTransfer)
 		r.Post("/transfers/{tid}/reject", s.rejectTransfer)
+
+		// 票据与收益提现
+		r.Get("/buildings/{id}/invoices", s.listInvoices)
+		r.Post("/invoices/{iid}/void", s.voidInvoice)
+		r.Get("/buildings/{id}/withdrawals", s.listWithdrawals)
+		r.Post("/buildings/{id}/withdrawals", s.createWithdrawal)
+		r.Post("/withdrawals/{wid}/review", s.reviewWithdrawal)
 
 		// 公告 / 异议投票 / 年报
 		r.Get("/buildings/{id}/announcements", s.listAnnouncements)

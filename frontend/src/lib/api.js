@@ -40,6 +40,37 @@ export const fmtMoney = (v) =>
 export const fmtNum = (v, d = 0) =>
   Number(v || 0).toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d })
 
+// 带 JWT 的文件下载（用于交割附件 CSV 导出）
+export async function apiDownload(path, fallbackName = 'export.csv') {
+  const resp = await fetch('/api' + path, {
+    headers: { Authorization: 'Bearer ' + getToken() },
+  })
+  if (!resp.ok) {
+    const text = await resp.text()
+    let msg = `下载失败 (${resp.status})`
+    try { msg = JSON.parse(text).error || msg } catch { /* ignore */ }
+    throw new Error(msg)
+  }
+  const blob = await resp.blob()
+  const cd = resp.headers.get('Content-Disposition') || ''
+  const m = cd.match(/filename="?([^"]+)"?/)
+  const name = m ? decodeURIComponent(m[1]) : fallbackName
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = name
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  URL.revokeObjectURL(url)
+}
+
+export const DEAL_TYPE_LABEL = {
+  follow_house: '随房转让',
+  early_exit: '提前结算退出',
+  transfer_neighbor: '转给同楼栋住户',
+}
+
 export const STAGES = [
   { key: 'draft', label: '立项建档' },
   { key: 'voting', label: '楼栋表决' },

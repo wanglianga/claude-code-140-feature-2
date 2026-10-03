@@ -88,18 +88,20 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	// 认购：张伟 30%、李娜 25%、王强 15%；赵敏只参与公共收益分配
-	sub := func(uid int64, ratio float64) {
+	sub := func(uid int64, ratio float64) int64 {
 		count := int(ratio/100*80 + 0.5)
-		if _, err := tx.Exec(ctx, `
+		var sid int64
+		if err := tx.QueryRow(ctx, `
 			INSERT INTO subscriptions(building_id,user_id,sub_type,panel_ratio,panel_count,amount,status,paid_at)
-			VALUES ($1,$2,'shareholder',$3,$4,$5,'paid',now())`,
-			b1, uid, ratio, count, count*1500); err != nil {
+			VALUES ($1,$2,'shareholder',$3,$4,$5,'paid',now()) RETURNING id`,
+			b1, uid, ratio, count, count*1500).Scan(&sid); err != nil {
 			panic(err)
 		}
+		return sid
 	}
-	sub(r1, 30)
-	sub(r2, 25)
-	sub(r3, 15)
+	sid1 := sub(r1, 30)
+	sid2 := sub(r2, 25)
+	sid3 := sub(r3, 15)
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO subscriptions(building_id,user_id,sub_type,panel_ratio,status,paid_at)
 		VALUES ($1,$2,'public_only',0,'paid',now())`, b1, r4); err != nil {
@@ -163,6 +165,82 @@ func Run(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	// 8 月结算：用结算引擎真实定稿，并同步台账/住户余额/收付款记录
 	if err := seedFinalizeAugust(ctx, tx, b1, property, r1, r2, r3); err != nil {
+		return err
+	}
+
+	// 票据：三户认购款票据 + 8 月住户收益凭证
+	for _, x := range []struct {
+		uid    int64
+		name   string
+		sid    int64
+		amount float64
+		item   string
+	}{
+		{r1, "张伟", sid1, 36000, "屋顶光伏组件认购款 24 块（30%）"},
+		{r2, "李娜", sid2, 30000, "屋顶光伏组件认购款 20 块（25%）"},
+		{r3, "王强", sid3, 18000, "屋顶光伏组件认购款 12 块（15%）"},
+	} {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO invoices(building_id,invoice_no,invoice_type,buyer_user_id,buyer_name,
+				item_name,amount,tax_amount,ref_type,ref_id,issued_by,memo)
+			VALUES ($1,$2,'normal',$3,$4,$5,$6,0,'subscription',$7,$8,'平台代开：个人光伏认购款凭证')`,
+			b1, fmt.Sprintf("PV2026-%04d", x.sid), x.uid, x.name, x.item, x.amount, x.sid, property); err != nil {
+			return err
+		}
+	}
+	var augPID int64
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM settlement_periods WHERE building_id=$1 AND period_month='2026-08'`, b1).Scan(&augPID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT user_id, amount FROM settlement_items
+		WHERE period_id=$1 AND item_type='shareholder' AND amount > 0 ORDER BY id`, augPID)
+	if err != nil {
+		return err
+	}
+	var earners []struct {
+		uid int64
+		amt float64
+	}
+	for rows.Next() {
+		var e struct {
+			uid int64
+			amt float64
+		}
+		if err := rows.Scan(&e.uid, &e.amt); err != nil {
+			rows.Close()
+			return err
+		}
+		earners = append(earners, e)
+	}
+	rows.Close()
+	for i, e := range earners {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO invoices(building_id,invoice_no,invoice_type,buyer_user_id,buyer_name,
+				item_name,amount,tax_amount,ref_type,ref_id,period_month,issued_by,memo)
+			SELECT $1,$2,'normal',$3,u.name,'2026-08 光伏发电收益结算凭证',$4,0,'settlement',$5,'2026-08',$6,'含电费收入与补贴分成'
+			FROM users u WHERE u.id=$3`,
+			b1, fmt.Sprintf("PV2026-08-%02d", i+1), e.uid, e.amt, augPID, property); err != nil {
+			return err
+		}
+	}
+	// 张伟已提现 200 元（8 月收益），演示交割附件中的已提现记录
+	if _, err := tx.Exec(ctx,
+		`UPDATE users SET balance=balance-200 WHERE id=$1`, r1); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO withdrawals(building_id,user_id,amount,status,bank_info,reviewer_id,paid_at)
+		VALUES ($1,$2,200,'paid','工商银行尾号 6011（演示）',$3,now())`,
+		b1, r1, property); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO ledger(building_id,user_id,direction,amount,category,ref_type,ref_id,memo)
+		VALUES ($1,$2,'out',200,'withdrawal','withdrawal',
+			(SELECT id FROM withdrawals WHERE building_id=$1 AND user_id=$2),'收益提现（工商银行尾号6011）')`,
+		b1, r1); err != nil {
 		return err
 	}
 

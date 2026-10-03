@@ -412,6 +412,15 @@ func (s *Server) finalizeSettlement(w http.ResponseWriter, r *http.Request) {
 				writeErr(w, 500, err.Error())
 				return
 			}
+			// 为正收益住户开具月度收益凭证（净收益 ≤ 0 的月份不开票）
+			if it.Amount > 0 {
+				if err := issueInvoice(r.Context(), tx, bid, "normal", &uid, "",
+					month+" 光伏发电收益结算凭证", it.Amount, "settlement", &sid, month, u.ID,
+					"含电费收入与补贴分成，已扣除运维/税费/维修分摊"); err != nil {
+					writeErr(w, 500, err.Error())
+					return
+				}
+			}
 		case "maintenance_fund":
 			// 专款标记：计提/动用（不影响公共账户现金净额）
 			led(nil, "in", "maintenance_fund", fundAddition, month+" 公共收益计提维修基金（专款标记）")

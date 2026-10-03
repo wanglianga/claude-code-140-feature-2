@@ -359,11 +359,22 @@ func (s *Server) paySubscription(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	// 开具认购款票据
+	if err := issueInvoice(r.Context(), tx, bid, "normal", &uid, "",
+		"屋顶光伏组件认购款 "+itoa(amount)+" 元", amount,
+		"subscription", &sid, "", u.ID, "住户在线缴费，平台代开凭证"); err != nil {
+		writeErr(w, 500, err.Error())
+		return
+	}
 	if err := tx.Commit(r.Context()); err != nil {
 		writeErr(w, 500, err.Error())
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func itoa(v float64) string {
+	return fmt.Sprintf("%.2f", v)
 }
 
 // refundSubscription 退购：仅在并网验收前可退；已缴款项原路退回（记 refund 流水）
@@ -413,6 +424,24 @@ func (s *Server) refundSubscription(w http.ResponseWriter, r *http.Request) {
 			`INSERT INTO ledger(building_id,user_id,direction,amount,category,ref_type,ref_id,memo)
 			 VALUES ($1,$2,'out',$3,'refund','subscription',$4,'退购退款至住户')`,
 			bid, uid, amount, sid); err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		// 冲红原认购票据
+		var origID int64
+		var origInvoice *int64
+		if e := tx.QueryRow(r.Context(),
+			`SELECT id FROM invoices WHERE building_id=$1 AND ref_type='subscription'
+			 AND ref_id=$2 AND invoice_type='normal' AND status='issued' ORDER BY id DESC LIMIT 1`,
+			bid, sid).Scan(&origID); e == nil {
+			origInvoice = &origID
+			if _, err := tx.Exec(r.Context(), `UPDATE invoices SET status='void' WHERE id=$1`, origID); err != nil {
+				writeErr(w, 500, err.Error())
+				return
+			}
+		}
+		if err := issueInvoiceParent(r.Context(), tx, bid, "red", origInvoice, &uid, "",
+			"退购退款：冲红原认购票据", amount, "refund", &sid, "", u.ID, "并网验收前退购，原路退款"); err != nil {
 			writeErr(w, 500, err.Error())
 			return
 		}

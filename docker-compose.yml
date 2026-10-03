@@ -13,7 +13,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5432:5432"
+      - "5433:5432"   # 宿主机 5433 → 容器 5432，避免与本机已装 PostgreSQL 的 5432 冲突
 
   app:
     build:
